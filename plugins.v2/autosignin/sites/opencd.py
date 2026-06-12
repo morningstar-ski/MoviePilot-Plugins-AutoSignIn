@@ -6,8 +6,8 @@ from lxml import etree
 from ruamel.yaml import CommentedMap
 
 from app.core.config import settings
-from app.helper.ocr import OcrHelper
 from app.log import logger
+from app.plugins.autosignin.captcha import CaptchaSolver
 from app.plugins.autosignin.sites import _ISiteSigninHandler
 from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
@@ -96,9 +96,11 @@ class Opencd(_ISiteSigninHandler):
         # 识别几次
         while times <= 3:
             # ocr二维码识别
-            ocr_result = OcrHelper().get_captcha_text(image_url=img_get_url,
-                                                      cookie=site_cookie,
-                                                      ua=ua)
+            ocr_result = CaptchaSolver.solve(image_url=img_get_url,
+                                             cookie=site_cookie,
+                                             ua=ua,
+                                             proxy=proxy,
+                                             website_url="https://www.open.cd/plugin_sign-in.php")
             logger.debug(f"ocr识别{site}验证码 {ocr_result}")
             if ocr_result:
                 if len(ocr_result) == 6:

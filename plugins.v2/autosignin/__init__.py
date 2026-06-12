@@ -1,8 +1,10 @@
+import random
 import re
 import traceback
 from datetime import datetime, timedelta
 from multiprocessing.dummy import Pool as ThreadPool
 from multiprocessing.pool import ThreadPool
+from threading import Lock
 from typing import Any, List, Dict, Tuple, Optional
 from urllib.parse import urljoin
 
@@ -21,10 +23,10 @@ from app.schemas.types import EventType, NotificationType
 from app.utils.http import RequestUtils
 from app.utils.site import SiteUtils
 from app.utils.string import StringUtils
-from app.utils.timer import TimerUtils
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 from ruamel.yaml import CommentedMap
+
+from .captcha import CaptchaSolver
 
 
 class AutoSignIn(_PluginBase):
@@ -35,7 +37,7 @@ class AutoSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "signin.png"
     # 插件版本
-    plugin_version = "2.9.1"
+    plugin_version = "2.9.4"
     # 插件作者
     plugin_author = "thsrite"
     # 作者主页
@@ -65,6 +67,20 @@ class AutoSignIn(_PluginBase):
     _start_time: int = None
     _end_time: int = None
     _auto_cf: int = 0
+    _final_check_time: str = "22:00"
+    _schedule_lock: Lock = Lock()
+    _schedule_state_key = "schedule_state_v2"
+    _random_begin_hour = 12
+    _random_end_hour = 18
+    _retry_min_minutes = 15
+    _retry_max_minutes = 20
+    _startup_reconcile_delay_seconds = 15
+    _captcha_provider: str = "moviepilot"
+    _captcha_api_key: str = ""
+    _captcha_api_base_url: str = ""
+    _captcha_task_type: str = ""
+    _captcha_model: str = ""
+    _captcha_timeout: int = 90
 
     def init_plugin(self, config: dict = None):
 
@@ -83,6 +99,13 @@ class AutoSignIn(_PluginBase):
             self._retry_keyword = config.get("retry_keyword")
             self._auto_cf = config.get("auto_cf")
             self._clean = config.get("clean")
+            self._final_check_time = config.get("final_check_time") or "22:00"
+            self._captcha_provider = config.get("captcha_provider") or "moviepilot"
+            self._captcha_api_key = config.get("captcha_api_key") or ""
+            self._captcha_api_base_url = config.get("captcha_api_base_url") or ""
+            self._captcha_task_type = config.get("captcha_task_type") or ""
+            self._captcha_model = config.get("captcha_model") or ""
+            self._captcha_timeout = config.get("captcha_timeout") or 90
 
             # 过滤掉已删除的站点
             all_sites = [site.id for site in SiteOper().list_order_by_pri()] + [site.get("id") for site in
@@ -94,18 +117,30 @@ class AutoSignIn(_PluginBase):
 
         # 加载模块
         if self._enabled or self._onlyonce:
+            self._configure_captcha_solver()
 
             self._site_schema = ModuleHelper.load('app.plugins.autosignin.sites',
                                                   filter_func=lambda _, obj: hasattr(obj, 'match'))
 
+            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+
+            if self._enabled:
+                logger.info("AutoSignIn startup reconcile will run in 15 seconds")
+                self._scheduler.add_job(func=self.service_tick,
+                                        trigger='date',
+                                        run_date=self._now() + timedelta(seconds=self._startup_reconcile_delay_seconds),
+                                        id="AutoSignInStartupTick",
+                                        name="AutoSignIn startup reconcile",
+                                        replace_existing=True)
+
             # 立即运行一次
             if self._onlyonce:
-                # 定时服务
-                self._scheduler = BackgroundScheduler(timezone=settings.TZ)
                 logger.info("站点自动签到服务启动，立即运行一次")
                 self._scheduler.add_job(func=self.sign_in, trigger='date',
                                         run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                                        name="站点自动签到")
+                                        id="AutoSignInOnlyOnce",
+                                        name="站点自动签到",
+                                        replace_existing=True)
 
                 # 关闭一次性开关
                 self._onlyonce = False
@@ -113,9 +148,9 @@ class AutoSignIn(_PluginBase):
                 self.__update_config()
 
                 # 启动任务
-                if self._scheduler.get_jobs():
-                    self._scheduler.print_jobs()
-                    self._scheduler.start()
+            if self._scheduler and self._scheduler.get_jobs():
+                self._scheduler.print_jobs()
+                self._scheduler.start()
 
     def get_state(self) -> bool:
         return self._enabled
@@ -134,6 +169,25 @@ class AutoSignIn(_PluginBase):
                 "retry_keyword": self._retry_keyword,
                 "auto_cf": self._auto_cf,
                 "clean": self._clean,
+                "final_check_time": self._final_check_time,
+                "captcha_provider": self._captcha_provider,
+                "captcha_api_key": self._captcha_api_key,
+                "captcha_api_base_url": self._captcha_api_base_url,
+                "captcha_task_type": self._captcha_task_type,
+                "captcha_model": self._captcha_model,
+                "captcha_timeout": self._captcha_timeout,
+            }
+        )
+
+    def _configure_captcha_solver(self):
+        CaptchaSolver.configure(
+            {
+                "provider": self._captcha_provider,
+                "api_key": self._captcha_api_key,
+                "api_base_url": self._captcha_api_base_url,
+                "task_type": self._captcha_task_type,
+                "model": self._captcha_model,
+                "timeout": self._captcha_timeout,
             }
         )
 
@@ -172,85 +226,15 @@ class AutoSignIn(_PluginBase):
         }]
 
     def get_service(self) -> List[Dict[str, Any]]:
-        """
-        注册插件公共服务
-        [{
-            "id": "服务ID",
-            "name": "服务名称",
-            "trigger": "触发器：cron/interval/date/CronTrigger.from_crontab()",
-            "func": self.xxx,
-            "kwargs": {} # 定时器参数
-        }]
-        """
-        if self._enabled and self._cron:
-            try:
-                if str(self._cron).strip().count(" ") == 4:
-                    return [{
-                        "id": "AutoSignIn",
-                        "name": "站点自动签到服务",
-                        "trigger": CronTrigger.from_crontab(self._cron),
-                        "func": self.sign_in,
-                        "kwargs": {}
-                    }]
-                else:
-                    # 2.3/9-23
-                    crons = str(self._cron).strip().split("/")
-                    if len(crons) == 2:
-                        # 2.3
-                        cron = crons[0]
-                        # 9-23
-                        times = crons[1].split("-")
-                        if len(times) == 2:
-                            # 9
-                            self._start_time = int(times[0])
-                            # 23
-                            self._end_time = int(times[1])
-                        if self._start_time and self._end_time:
-                            return [{
-                                "id": "AutoSignIn",
-                                "name": "站点自动签到服务",
-                                "trigger": "interval",
-                                "func": self.sign_in,
-                                "kwargs": {
-                                    "hours": float(str(cron).strip()),
-                                }
-                            }]
-                        else:
-                            logger.error("站点自动签到服务启动失败，周期格式错误")
-                    else:
-                        # 默认0-24 按照周期运行
-                        return [{
-                            "id": "AutoSignIn",
-                            "name": "站点自动签到服务",
-                            "trigger": "interval",
-                            "func": self.sign_in,
-                            "kwargs": {
-                                "hours": float(str(self._cron).strip()),
-                            }
-                        }]
-            except Exception as err:
-                logger.error(f"定时任务配置错误：{str(err)}")
-        elif self._enabled:
-            # 随机时间
-            triggers = TimerUtils.random_scheduler(num_executions=2,
-                                                   begin_hour=9,
-                                                   end_hour=23,
-                                                   max_interval=6 * 60,
-                                                   min_interval=2 * 60)
-            ret_jobs = []
-            for trigger in triggers:
-                ret_jobs.append({
-                    "id": f"AutoSignIn|{trigger.hour}:{trigger.minute}",
-                    "name": "站点自动签到服务",
-                    "trigger": "cron",
-                    "func": self.sign_in,
-                    "kwargs": {
-                        "hour": trigger.hour,
-                        "minute": trigger.minute
-                    }
-                })
-            return ret_jobs
-        return []
+        return [{
+            "id": "AutoSignInHeartbeat",
+            "name": "站点自动签到巡检服务",
+            "trigger": "interval",
+            "func": self.service_tick,
+            "kwargs": {
+                "minutes": 1
+            }
+        }] if self._enabled else []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
@@ -347,11 +331,11 @@ class AutoSignIn(_PluginBase):
                                 },
                                 'content': [
                                     {
-                                        'component': 'VCronField',
+                                        'component': 'VTextField',
                                         'props': {
-                                            'model': 'cron',
-                                            'label': '执行周期',
-                                            'placeholder': '5位cron表达式，留空自动'
+                                            'model': 'final_check_time',
+                                            'label': '最终检查时间',
+                                            'placeholder': '默认 22:00，格式 HH:MM'
                                         }
                                     }
                                 ]
@@ -383,8 +367,8 @@ class AutoSignIn(_PluginBase):
                                         'component': 'VTextField',
                                         'props': {
                                             'model': 'retry_keyword',
-                                            'label': '重试关键词',
-                                            'placeholder': '支持正则表达式，命中才重签'
+                                            'label': '重试关键词(兼容保留)',
+                                            'placeholder': '当前版本默认所有失败都会随机 15-20 分钟重试'
                                         }
                                     }
                                 ]
@@ -402,6 +386,120 @@ class AutoSignIn(_PluginBase):
                                             'model': 'auto_cf',
                                             'label': '自动优选',
                                             'placeholder': '命中重试关键词次数（0-关闭）'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'model': 'captcha_provider',
+                                            'label': '验证码识别',
+                                            'items': [
+                                                {'title': 'MoviePilot 免费OCR', 'value': 'moviepilot'},
+                                                {'title': 'YesCaptcha', 'value': 'yescaptcha'},
+                                                {'title': 'CapSolver', 'value': 'capsolver'},
+                                                {'title': '2Captcha', 'value': 'twocaptcha'},
+                                                {'title': 'Anti-Captcha', 'value': 'anticaptcha'},
+                                                {'title': '自定义兼容接口', 'value': 'custom'}
+                                            ]
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'captcha_api_key',
+                                            'label': '验证码API Key',
+                                            'type': 'password',
+                                            'placeholder': '默认 MoviePilot 免费OCR 可留空'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'captcha_api_base_url',
+                                            'label': '验证码API地址',
+                                            'placeholder': '留空使用预置官方地址，自定义兼容接口时必填'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'captcha_task_type',
+                                            'label': '验证码任务类型',
+                                            'placeholder': '高级项，留空使用预置默认值'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'captcha_model',
+                                            'label': '验证码模型',
+                                            'placeholder': 'Capsolver 可填 common'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'captcha_timeout',
+                                            'label': '验证码超时(秒)'
                                         }
                                     }
                                 ]
@@ -462,11 +560,7 @@ class AutoSignIn(_PluginBase):
                                         'props': {
                                             'type': 'info',
                                             'variant': 'tonal',
-                                            'text': '执行周期支持：'
-                                                    '1、5位cron表达式；'
-                                                    '2、配置间隔（小时），如2.3/9-23（9-23点之间每隔2.3小时执行一次）；'
-                                                    '3、周期不填默认9-23点随机执行2次。'
-                                                    '每天首次全量执行，其余执行命中重试关键词的站点。'
+                                            'text': '每天 12:00-18:59 之间为签到和模拟登录各生成一次随机主任务；失败后会按 15-20 分钟随机重试直到成功；最终检查时间默认 22:00，可单独配置。'
                                         }
                                     }
                                 ]
@@ -487,7 +581,7 @@ class AutoSignIn(_PluginBase):
                                         'props': {
                                             'type': 'info',
                                             'variant': 'tonal',
-                                            'text': '自动优选：0-关闭，命中重试关键词次数大于该数量时自动执行Cloudflare IP优选（需要开启且则正确配置Cloudflare IP优选插件和自定义Hosts插件）'
+                                            'text': '验证码识别默认走 MoviePilot 免费OCR；也可切换 YesCaptcha、CapSolver、2Captcha、Anti-Captcha 或自定义兼容 createTask/getTaskResult 接口。'
                                         }
                                     }
                                 ]
@@ -521,9 +615,16 @@ class AutoSignIn(_PluginBase):
             "enabled": False,
             "notify": True,
             "cron": "",
+            "final_check_time": "22:00",
             "auto_cf": 0,
             "onlyonce": False,
             "clean": False,
+            "captcha_provider": "moviepilot",
+            "captcha_api_key": "",
+            "captcha_api_base_url": "",
+            "captcha_task_type": "",
+            "captcha_model": "",
+            "captcha_timeout": 90,
             "queue_cnt": 5,
             "sign_sites": [],
             "login_sites": [],
@@ -1395,208 +1496,447 @@ class AutoSignIn(_PluginBase):
 
     @eventmanager.register(EventType.PluginAction)
     def sign_in(self, event: Event = None):
-        """
-        自动签到|模拟登录
-        """
         if event:
             event_data = event.event_data
             if not event_data or event_data.get("action") != "site_signin":
                 return
-        # 日期
-        today = datetime.today()
-        if self._start_time and self._end_time:
-            if int(datetime.today().hour) < self._start_time or int(datetime.today().hour) > self._end_time:
-                logger.error(
-                    f"当前时间 {int(datetime.today().hour)} 不在 {self._start_time}-{self._end_time} 范围内，暂不执行任务")
-                return
-        if event:
-            logger.info("收到命令，开始站点签到 ...")
-            self.post_message(channel=event.event_data.get("channel"),
-                              title="开始站点签到 ...",
-                              userid=event.event_data.get("user"))
 
-        if self._sign_sites:
-            self.__do(today=today, type_str="签到", do_sites=self._sign_sites, event=event)
-        if self._login_sites:
-            self.__do(today=today, type_str="登录", do_sites=self._login_sites, event=event)
-
-    def __do(self, today: datetime, type_str: str, do_sites: list, event: Event = None):
-        """
-        签到逻辑
-        """
-        yesterday = today - timedelta(days=1)
-        yesterday_str = yesterday.strftime('%Y-%m-%d')
-        # 删除昨天历史
-        self.del_data(key=type_str + "-" + yesterday_str)
-        self.del_data(key=f"{yesterday.month}月{yesterday.day}日")
-
-        # 查看今天有没有签到|登录历史
-        today = today.strftime('%Y-%m-%d')
-        today_history = self.get_data(key=type_str + "-" + today)
-
-        # 查询所有站点
-        all_sites = [site for site in SitesHelper().get_indexers() if not site.get("public")] + self.__custom_sites()
-        # 过滤掉没有选中的站点
-        if do_sites:
-            do_sites = [site for site in all_sites if site.get("id") in do_sites]
-        else:
-            do_sites = all_sites
-
-        # 今日没数据
-        if not today_history or self._clean:
-            logger.info(f"今日 {today} 未{type_str}，开始{type_str}已选站点")
-            if self._clean:
-                # 关闭开关
-                self._clean = False
-        else:
-            # 需要重试站点
-            retry_sites = today_history.get("retry") or []
-            # 今天已签到|登录站点
-            already_sites = today_history.get("do") or []
-
-            # 今日未签|登录站点
-            no_sites = [site for site in do_sites if
-                        site.get("id") not in already_sites or site.get("id") in retry_sites]
-
-            if not no_sites:
-                logger.info(f"今日 {today} 已{type_str}，无重新{type_str}站点，本次任务结束")
-                return
-
-            # 任务站点 = 需要重试+今日未do
-            do_sites = no_sites
-            logger.info(f"今日 {today} 已{type_str}，开始重试命中关键词站点")
-
-        if not do_sites:
-            logger.info(f"没有需要{type_str}的站点")
+        if not self._schedule_lock.acquire(blocking=False):
+            logger.warn("AutoSignIn task is already running, skip this request")
             return
 
-        # 执行签到
-        logger.info(f"开始执行{type_str}任务 ...")
-        if type_str == "签到":
-            with ThreadPool(min(len(do_sites), int(self._queue_cnt))) as p:
-                status = p.map(self.signin_site, do_sites)
-        else:
-            with ThreadPool(min(len(do_sites), int(self._queue_cnt))) as p:
-                status = p.map(self.login_site, do_sites)
+        try:
+            now = self._now()
+            state = self._ensure_schedule_state(now)
 
-        if status:
-            logger.info(f"站点{type_str}任务完成！")
-            # 获取今天的日期
-            key = f"{datetime.now().month}月{datetime.now().day}日"
-            today_data = self.get_data(key)
-            if today_data:
-                if not isinstance(today_data, list):
-                    today_data = [today_data]
-                for s in status:
-                    today_data.append({
-                        "site": s[0],
-                        "status": s[1]
-                    })
+            if event:
+                logger.info("Receive manual site signin command")
+                self.post_message(channel=event.event_data.get("channel"),
+                                  title="开始站点签到...",
+                                  userid=event.event_data.get("user"))
+
+            self._run_task(task_key="signin",
+                           site_ids=self._normalize_site_ids(self._sign_sites),
+                           state=state,
+                           now=now,
+                           reason="manual")
+            self._run_task(task_key="login",
+                           site_ids=self._normalize_site_ids(self._login_sites),
+                           state=state,
+                           now=now,
+                           reason="manual")
+            self._save_schedule_state(state)
+
+            if event:
+                self.post_message(channel=event.event_data.get("channel"),
+                                  title="站点签到完成",
+                                  userid=event.event_data.get("user"))
+        except Exception as err:
+            logger.error(f"AutoSignIn manual task failed: {err}")
+            logger.error(traceback.format_exc())
+            if event:
+                self.post_message(channel=event.event_data.get("channel"),
+                                  title="站点签到任务失败",
+                                  userid=event.event_data.get("user"))
+        finally:
+            self._schedule_lock.release()
+            self.__update_config()
+
+    def service_tick(self):
+        if not self._enabled:
+            return
+
+        if not self._schedule_lock.acquire(blocking=False):
+            logger.info("AutoSignIn task is still running, skip this heartbeat")
+            return
+
+        try:
+            now = self._now()
+            state = self._ensure_schedule_state(now)
+
+            for task_key in ("signin", "login"):
+                due_site_ids, reason = self._get_due_site_ids(state, task_key, now)
+                if due_site_ids:
+                    self._run_task(task_key=task_key,
+                                   site_ids=due_site_ids,
+                                   state=state,
+                                   now=now,
+                                   reason=reason)
+
+            final_check_at = self._from_iso(state.get("final_check_at")) or self._parse_final_check_time(now)
+            if now >= final_check_at and not state.get("final_check_done"):
+                self._run_final_check(state, now)
+
+            self._save_schedule_state(state)
+        except Exception as err:
+            logger.error(f"AutoSignIn heartbeat failed: {err}")
+            logger.error(traceback.format_exc())
+        finally:
+            self._schedule_lock.release()
+
+    def _now(self) -> datetime:
+        return datetime.now(tz=pytz.timezone(settings.TZ))
+
+    @staticmethod
+    def _to_iso(dt: Optional[datetime]) -> Optional[str]:
+        if not dt:
+            return None
+        return dt.isoformat(timespec="seconds")
+
+    def _from_iso(self, value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is None:
+                return pytz.timezone(settings.TZ).localize(dt)
+            return dt.astimezone(pytz.timezone(settings.TZ))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_site_ids(site_ids: Optional[list]) -> List[str]:
+        normalized = []
+        for site_id in site_ids or []:
+            site_id = str(site_id)
+            if site_id not in normalized:
+                normalized.append(site_id)
+        return normalized
+
+    def _get_site_map(self) -> Dict[str, Any]:
+        all_sites = [site for site in SitesHelper().get_indexers() if not site.get("public")] + self.__custom_sites()
+        return {str(site.get("id")): site for site in all_sites if site.get("id") is not None}
+
+    def _random_day_time(self, now: datetime, start_hour: int, end_hour: int) -> datetime:
+        start_at = now.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+        end_at = now.replace(hour=end_hour, minute=59, second=59, microsecond=0)
+        total_minutes = max(int((end_at - start_at).total_seconds() // 60), 0)
+        return start_at + timedelta(minutes=random.randint(0, total_minutes))
+
+    @staticmethod
+    def _format_clock(dt: Optional[datetime]) -> str:
+        if not dt:
+            return "-"
+        return dt.strftime("%H:%M")
+
+    @staticmethod
+    def _format_site_list(site_map: Dict[str, Any], site_ids: list) -> str:
+        site_names = []
+        for site_id in site_ids or []:
+            site_info = site_map.get(site_id) or {}
+            site_names.append(site_info.get("name") or str(site_id))
+        return ", ".join(site_names) if site_names else "none"
+
+    def _parse_final_check_time(self, now: datetime) -> datetime:
+        try:
+            hour_str, minute_str = str(self._final_check_time or "22:00").split(":", 1)
+            hour = int(hour_str)
+            minute = int(minute_str)
+            if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+                raise ValueError("invalid final check time")
+        except Exception:
+            logger.error(f"Invalid final check time: {self._final_check_time}, fallback to 22:00")
+            hour = 22
+            minute = 0
+        return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    def _build_site_runtime(self, site_info: Any) -> dict:
+        return {
+            "site_name": site_info.get("name") if site_info else "",
+            "success": False,
+            "attempts": 0,
+            "last_message": "",
+            "last_run_at": None,
+            "next_retry_at": None,
+        }
+
+    def _build_task_state(self, selected_sites: list, label: str, site_map: Dict[str, Any], now: datetime) -> dict:
+        selected_site_ids = [site_id for site_id in self._normalize_site_ids(selected_sites) if site_id in site_map]
+        return {
+            "label": label,
+            "planned_at": self._to_iso(self._random_day_time(now,
+                                                              self._random_begin_hour,
+                                                              self._random_end_hour)),
+            "selected_sites": selected_site_ids,
+            "sites": {
+                site_id: self._build_site_runtime(site_map.get(site_id))
+                for site_id in selected_site_ids
+            }
+        }
+
+    def _sync_task_state(self, task_state: Optional[dict], selected_sites: list, label: str,
+                         site_map: Dict[str, Any], now: datetime) -> dict:
+        if not isinstance(task_state, dict):
+            task_state = self._build_task_state(selected_sites, label, site_map, now)
+
+        selected_site_ids = [site_id for site_id in self._normalize_site_ids(selected_sites) if site_id in site_map]
+        planned_at = self._from_iso(task_state.get("planned_at")) or self._random_day_time(now,
+                                                                                              self._random_begin_hour,
+                                                                                              self._random_end_hour)
+        sites_state = task_state.get("sites") or {}
+        synced_sites = {}
+        for site_id in selected_site_ids:
+            site_runtime = sites_state.get(site_id) or self._build_site_runtime(site_map.get(site_id))
+            site_runtime["site_name"] = site_map.get(site_id).get("name")
+            synced_sites[site_id] = site_runtime
+
+        task_state["label"] = label
+        task_state["planned_at"] = self._to_iso(planned_at)
+        task_state["selected_sites"] = selected_site_ids
+        task_state["sites"] = synced_sites
+        return task_state
+
+    def _build_schedule_state(self, now: datetime) -> dict:
+        site_map = self._get_site_map()
+        state = {
+            "date": now.strftime("%Y-%m-%d"),
+            "final_check_at": self._to_iso(self._parse_final_check_time(now)),
+            "final_check_done": False,
+            "tasks": {
+                "signin": self._build_task_state(self._sign_sites, "签到", site_map, now),
+                "login": self._build_task_state(self._login_sites, "模拟登录", site_map, now),
+            }
+        }
+        signin_at = self._from_iso(state.get("tasks", {}).get("signin", {}).get("planned_at"))
+        login_at = self._from_iso(state.get("tasks", {}).get("login", {}).get("planned_at"))
+        final_check_at = self._from_iso(state.get("final_check_at"))
+        logger.info(f"AutoSignIn daily plan generated: signin={self._format_clock(signin_at)} "
+                    f"login={self._format_clock(login_at)} final_check={self._format_clock(final_check_at)}")
+        return state
+
+    def _load_schedule_state(self) -> dict:
+        state = self.get_data(key=self._schedule_state_key)
+        return state if isinstance(state, dict) else {}
+
+    def _save_schedule_state(self, state: dict):
+        self.save_data(key=self._schedule_state_key, value=state)
+
+    def _ensure_schedule_state(self, now: datetime) -> dict:
+        state = self._load_schedule_state()
+        today = now.strftime("%Y-%m-%d")
+
+        if self._clean or state.get("date") != today:
+            state = self._build_schedule_state(now)
+            if self._clean:
+                self._clean = False
+            self.__update_config()
+            self._save_schedule_state(state)
+            return state
+
+        site_map = self._get_site_map()
+        state["final_check_at"] = self._to_iso(self._parse_final_check_time(now))
+        state["final_check_done"] = bool(state.get("final_check_done"))
+        tasks = state.get("tasks") or {}
+        state["tasks"] = {
+            "signin": self._sync_task_state(tasks.get("signin"), self._sign_sites, "签到", site_map, now),
+            "login": self._sync_task_state(tasks.get("login"), self._login_sites, "模拟登录", site_map, now),
+        }
+        logger.debug(f"AutoSignIn heartbeat state: date={state.get('date')} final_check={self._format_clock(self._from_iso(state.get('final_check_at')))}")
+        return state
+
+    def _get_pending_site_ids(self, state: dict, task_key: str) -> List[str]:
+        task_state = (state.get("tasks") or {}).get(task_key) or {}
+        pending_site_ids = []
+        for site_id in task_state.get("selected_sites") or []:
+            site_runtime = (task_state.get("sites") or {}).get(site_id) or {}
+            if not site_runtime.get("success"):
+                pending_site_ids.append(site_id)
+        return pending_site_ids
+
+    def _get_due_site_ids(self, state: dict, task_key: str, now: datetime) -> Tuple[List[str], Optional[str]]:
+        task_state = (state.get("tasks") or {}).get(task_key) or {}
+        planned_at = self._from_iso(task_state.get("planned_at")) or self._random_day_time(now,
+                                                                                              self._random_begin_hour,
+                                                                                              self._random_end_hour)
+        first_run_due = []
+        retry_due = []
+        for site_id in task_state.get("selected_sites") or []:
+            site_runtime = (task_state.get("sites") or {}).get(site_id) or {}
+            if site_runtime.get("success"):
+                continue
+
+            attempts = int(site_runtime.get("attempts") or 0)
+            retry_at = self._from_iso(site_runtime.get("next_retry_at"))
+            if attempts == 0 and now >= planned_at:
+                first_run_due.append(site_id)
+            elif retry_at and now >= retry_at:
+                retry_due.append(site_id)
+
+        if first_run_due:
+            return first_run_due + [site_id for site_id in retry_due if site_id not in first_run_due], "scheduled"
+        if retry_due:
+            return retry_due, "retry"
+        return [], None
+
+    def _next_retry_time(self, now: datetime) -> datetime:
+        return now + timedelta(minutes=random.randint(self._retry_min_minutes, self._retry_max_minutes))
+
+    @staticmethod
+    def _is_success_message(task_key: str, message: str) -> bool:
+        message = str(message or "")
+        if task_key == "signin":
+            return any(token in message for token in ["签到成功", "仿真签到成功", "已签到"])
+        return "模拟登录成功" in message
+
+    @staticmethod
+    def _need_refresh_cookie(message: str) -> bool:
+        return "Cookie已失效" in str(message or "")
+
+    def _wrap_signin_site(self, site_info: Any) -> Tuple[str, str, str, bool]:
+        site_name, message = self.signin_site(site_info)
+        return str(site_info.get("id")), site_name, message, self._is_success_message("signin", message)
+
+    def _wrap_login_site(self, site_info: Any) -> Tuple[str, str, str, bool]:
+        site_name, message = self.login_site(site_info)
+        return str(site_info.get("id")), site_name, message, self._is_success_message("login", message)
+
+    def _append_daily_log(self, now: datetime, results: list):
+        key = f"{now.month}月{now.day}日"
+        today_data = self.get_data(key) or []
+        if not isinstance(today_data, list):
+            today_data = [today_data]
+        for _, site_name, message, _ in results:
+            today_data.append({
+                "site": site_name,
+                "status": message
+            })
+        self.save_data(key, today_data)
+
+    def _save_legacy_task_history(self, task_key: str, state: dict, now: datetime):
+        task_state = (state.get("tasks") or {}).get(task_key) or {}
+        label = task_state.get("label")
+        if not label:
+            return
+        self.save_data(
+            key=f"{label}-{now.strftime('%Y-%m-%d')}",
+            value={
+                "do": self._normalize_site_ids(task_state.get("selected_sites") or []),
+                "retry": self._get_pending_site_ids(state, task_key)
+            }
+        )
+
+    def _maybe_send_batch_notification(self, task_key: str, reason: str, task_state: dict,
+                                       run_site_ids: list, results: list,
+                                       unresolved_before: int, unresolved_after: int):
+        if reason in ["manual", "final_check"]:
+            return
+        if not self._notify:
+            return
+        if reason == "retry" and unresolved_after > 0:
+            return
+
+        reason_map = {
+            "scheduled": "随机主任务",
+            "retry": "失败重试补齐",
+        }
+        detail_lines = "\n".join([f"【{site_name}】{message}" for _, site_name, message, _ in results])
+        self.post_message(title=f"【站点自动{task_state.get('label')}】",
+                          mtype=NotificationType.SiteMessage,
+                          text=f"执行阶段: {reason_map.get(reason, reason)}\n"
+                               f"配置站点数: {len(task_state.get('selected_sites') or [])}\n"
+                               f"本次执行数: {len(run_site_ids)}\n"
+                               f"剩余未完成: {unresolved_after}\n"
+                               f"执行前未完成: {unresolved_before}\n"
+                               f"{detail_lines}")
+
+    def _run_task(self, task_key: str, site_ids: list, state: dict, now: datetime, reason: str):
+        task_state = (state.get("tasks") or {}).get(task_key) or {}
+        site_map = self._get_site_map()
+        normalized_site_ids = [site_id for site_id in self._normalize_site_ids(site_ids) if site_id in site_map]
+        if not normalized_site_ids:
+            return []
+
+        site_infos = [site_map[site_id] for site_id in normalized_site_ids]
+        worker = self._wrap_signin_site if task_key == "signin" else self._wrap_login_site
+        unresolved_before = len(self._get_pending_site_ids(state, task_key))
+        logger.info(f"Start AutoSignIn task: {task_state.get('label')} reason={reason} "
+                    f"count={len(site_infos)} sites={self._format_site_list(site_map, normalized_site_ids)}")
+
+        queue_size = max(1, int(self._queue_cnt or 1))
+        with ThreadPool(min(len(site_infos), queue_size)) as pool:
+            results = pool.map(worker, site_infos)
+
+        failed_count = 0
+        for site_id, site_name, message, success in results:
+            site_runtime = (task_state.get("sites") or {}).get(site_id) or self._build_site_runtime(site_map.get(site_id))
+            site_runtime["site_name"] = site_name
+            site_runtime["attempts"] = int(site_runtime.get("attempts") or 0) + 1
+            site_runtime["last_message"] = message
+            site_runtime["last_run_at"] = self._to_iso(now)
+            if success:
+                site_runtime["success"] = True
+                site_runtime["next_retry_at"] = None
+                logger.info(f"AutoSignIn {task_state.get('label')} success: {site_name} attempts={site_runtime['attempts']}")
             else:
-                today_data = [{
-                    "site": s[0],
-                    "status": s[1]
-                } for s in status]
-            # 保存数据
-            self.save_data(key, today_data)
+                failed_count += 1
+                site_runtime["success"] = False
+                site_runtime["next_retry_at"] = self._to_iso(self._next_retry_time(now))
+                logger.warn(f"AutoSignIn {task_state.get('label')} failed: {site_name} "
+                            f"next_retry={self._format_clock(self._from_iso(site_runtime['next_retry_at']))} "
+                            f"message={message}")
+            task_state.setdefault("sites", {})[site_id] = site_runtime
 
-            # 命中重试词的站点id
-            retry_sites = []
-            # 命中重试词的站点签到msg
-            retry_msg = []
-            # 登录成功
-            login_success_msg = []
-            # 签到成功
-            sign_success_msg = []
-            # 已签到
-            already_sign_msg = []
-            # 仿真签到成功
-            fz_sign_msg = []
-            # 失败｜错误
-            failed_msg = []
+            if self._need_refresh_cookie(message) and getattr(self, "eventmanager", None):
+                logger.info(f"Trigger site refresh for {site_name}")
+                self.eventmanager.send_event(EventType.PluginAction,
+                                             {
+                                                 "site_id": site_id,
+                                                 "action": "site_refresh"
+                                             })
 
-            sites = {site.get('name'): site.get("id") for site in SitesHelper().get_indexers() if
-                     not site.get("public")}
-            for s in status:
-                site_name = s[0]
-                site_id = None
-                if site_name:
-                    site_id = sites.get(site_name)
-
-                if 'Cookie已失效' in str(s) and site_id:
-                    # 触发自动登录插件登录
-                    logger.info(f"触发站点 {site_name} 自动登录更新Cookie和Ua")
-                    self.eventmanager.send_event(EventType.PluginAction,
-                                                 {
-                                                     "site_id": site_id,
-                                                     "action": "site_refresh"
-                                                 })
-                # 记录本次命中重试关键词的站点
-                if self._retry_keyword:
-                    if site_id:
-                        match = re.search(self._retry_keyword, s[1])
-                        if match:
-                            logger.debug(f"站点 {site_name} 命中重试关键词 {self._retry_keyword}")
-                            retry_sites.append(site_id)
-                            # 命中的站点
-                            retry_msg.append(s)
-                            continue
-
-                if "登录成功" in str(s):
-                    login_success_msg.append(s)
-                elif "仿真签到成功" in str(s):
-                    fz_sign_msg.append(s)
-                    continue
-                elif "签到成功" in str(s):
-                    sign_success_msg.append(s)
-                elif '已签到' in str(s):
-                    already_sign_msg.append(s)
-                else:
-                    failed_msg.append(s)
-
-            if not self._retry_keyword:
-                # 没设置重试关键词则重试已选站点
-                retry_sites = self._sign_sites if type_str == "签到" else self._login_sites
-            logger.debug(f"下次{type_str}重试站点 {retry_sites}")
-
-            # 存入历史
-            self.save_data(key=type_str + "-" + today,
-                           value={
-                               "do": self._sign_sites if type_str == "签到" else self._login_sites,
-                               "retry": retry_sites
-                           })
-
-            # 自动Cloudflare IP优选
-            if self._auto_cf and int(self._auto_cf) > 0 and retry_msg and len(retry_msg) >= int(self._auto_cf):
+        if self._auto_cf and int(self._auto_cf or 0) > 0 and failed_count >= int(self._auto_cf or 0):
+            if getattr(self, "eventmanager", None):
                 self.eventmanager.send_event(EventType.PluginAction, {
                     "action": "cloudflare_speedtest"
                 })
 
-            # 发送通知
-            if self._notify:
-                # 签到详细信息 登录成功、签到成功、已签到、仿真签到成功、失败--命中重试
-                signin_message = login_success_msg + sign_success_msg + already_sign_msg + fz_sign_msg + failed_msg
-                if len(retry_msg) > 0:
-                    signin_message += retry_msg
+        self._append_daily_log(now, results)
+        self._save_legacy_task_history(task_key, state, now)
+        unresolved_after = len(self._get_pending_site_ids(state, task_key))
+        logger.info(f"AutoSignIn {task_state.get('label')} run finished, unresolved={unresolved_after}")
+        self._maybe_send_batch_notification(task_key=task_key,
+                                            reason=reason,
+                                            task_state=task_state,
+                                            run_site_ids=normalized_site_ids,
+                                            results=results,
+                                            unresolved_before=unresolved_before,
+                                            unresolved_after=unresolved_after)
+        return results
 
-                signin_message = "\n".join([f'【{s[0]}】{s[1]}' for s in signin_message if s])
-                self.post_message(title=f"【站点自动{type_str}】",
-                                  mtype=NotificationType.SiteMessage,
-                                  text=f"全部{type_str}数量: {len(self._sign_sites if type_str == '签到' else self._login_sites)} \n"
-                                       f"本次{type_str}数量: {len(do_sites)} \n"
-                                       f"下次{type_str}数量: {len(retry_sites) if self._retry_keyword else 0} \n"
-                                       f"{signin_message}"
-                                  )
-            if event:
-                self.post_message(channel=event.event_data.get("channel"),
-                                  title=f"站点{type_str}完成！", userid=event.event_data.get("user"))
-        else:
-            logger.error(f"站点{type_str}任务失败！")
-            if event:
-                self.post_message(channel=event.event_data.get("channel"),
-                                  title=f"站点{type_str}任务失败！", userid=event.event_data.get("user"))
-        # 保存配置
-        self.__update_config()
+    def _run_final_check(self, state: dict, now: datetime):
+        attempted = False
+        logger.info(f"Start AutoSignIn final check at {self._final_check_time}")
+        for task_key in ("signin", "login"):
+            pending_site_ids = self._get_pending_site_ids(state, task_key)
+            if pending_site_ids:
+                attempted = True
+                self._run_task(task_key=task_key,
+                               site_ids=pending_site_ids,
+                               state=state,
+                               now=now,
+                               reason="final_check")
+
+        state["final_check_done"] = True
+        failed_lines = []
+        for task_key in ("signin", "login"):
+            task_state = (state.get("tasks") or {}).get(task_key) or {}
+            for site_id in self._get_pending_site_ids(state, task_key):
+                site_runtime = (task_state.get("sites") or {}).get(site_id) or {}
+                failed_lines.append(f"【{task_state.get('label')}】{site_runtime.get('site_name')}：{site_runtime.get('last_message')}")
+
+        if failed_lines:
+            failed_text = "\n".join(failed_lines)
+            logger.warn(f"AutoSignIn final check still has pending sites: {failed_text}")
+            self.post_message(title="【站点自动签到最终检查】",
+                              mtype=NotificationType.SiteMessage,
+                              text=f"最终检查时间: {self._final_check_time}\n"
+                                   f"以下站点在最终检查后仍未完成，插件会继续按 15-20 分钟随机重试：\n"
+                                   f"{failed_text}")
+        elif attempted and self._notify:
+            logger.info("AutoSignIn final check completed with all sites done")
+            self.post_message(title="【站点自动签到最终检查】",
+                              mtype=NotificationType.SiteMessage,
+                              text=f"最终检查时间: {self._final_check_time}\n所有已配置站点的签到和模拟登录均已完成。")
 
     def __build_class(self, url) -> Any:
         for site_schema in self._site_schema:
