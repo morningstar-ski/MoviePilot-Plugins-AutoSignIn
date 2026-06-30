@@ -18,7 +18,7 @@
 在 MoviePilot 插件市场中，使用以下仓库地址安装：
 
 ```
-https://github.com/morningstar-ski/MoviePilot-Plugins-Custom
+https://github.com/morningstar-ski/MoviePilot-Plugins-AutoSignIn
 ```
 
 或使用本地路径：

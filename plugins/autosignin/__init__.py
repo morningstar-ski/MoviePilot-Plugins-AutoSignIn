@@ -44,7 +44,7 @@ class AutoSignIn(_PluginBase):
     # 插件作者
     plugin_author = "morningstar-ski"
     # 作者主页
-    author_url = "https://github.com/morningstar-ski/MoviePilot-Plugins-Custom"
+    author_url = "https://github.com/morningstar-ski/MoviePilot-Plugins-AutoSignIn"
     # 插件配置项ID前缀
     plugin_config_prefix = "autosignin_"
     # 加载顺序
