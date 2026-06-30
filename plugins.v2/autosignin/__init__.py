@@ -39,9 +39,9 @@ class AutoSignIn(_PluginBase):
     # 插件版本
     plugin_version = "2.9.4"
     # 插件作者
-    plugin_author = "thsrite"
+    plugin_author = "morningstar-ski"
     # 作者主页
-    author_url = "https://github.com/thsrite"
+    author_url = "https://github.com/morningstar-ski/MoviePilot-Plugins-Custom"
     # 插件配置项ID前缀
     plugin_config_prefix = "autosignin_"
     # 加载顺序
