@@ -48,7 +48,6 @@
     "icon": "signin.png",
     "author": "morningstar-ski",
     "level": 2,
-    "release": true,
     "history": {
       "v2.9.1": "修复详情页历史记录部分站点只显示站点ID的问题",
       "v2.9.0": "优化插件详情页，改为紧凑状态矩阵展示签到和登录情况",
