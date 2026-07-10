@@ -3,11 +3,12 @@
     "name": "站点自动签到",
     "description": "自动模拟登录、签到站点。",
     "labels": "站点",
-    "version": "2.9.4",
+    "version": "2.9.5",
     "icon": "signin.png",
     "author": "morningstar-ski",
     "level": 2,
     "history": {
+      "v2.9.5": "修复签到验证码重试时复用旧验证码导致的首次失败问题",
       "v2.4.4": "增加保号风险提示",
       "v2.4.3": "修复空签到失败问题",
       "v2.4.2": "修复PT时间签到失败问题",

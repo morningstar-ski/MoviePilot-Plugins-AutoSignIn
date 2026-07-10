@@ -1,4 +1,7 @@
+import importlib
+import json
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 import pytz
@@ -206,3 +209,101 @@ def test_captcha_provider_defaults_and_fallbacks(generation):
     assert custom["api_base_url"] == "https://example.com/api"
     assert fallback["provider"] == "moviepilot"
     assert solver._resolve_api_url("https://api.yescaptcha.com", "createTask") == "https://api.yescaptcha.com/createTask"
+
+
+@pytest.mark.parametrize("generation", ["v1", "v2"])
+def test_hdsky_refetches_captcha_after_invalid_imagehash(generation, monkeypatch):
+    load_autosignin_module(generation)
+    hdsky_module = importlib.import_module("app.plugins.autosignin.sites.hdsky")
+    handler = hdsky_module.HDSky()
+    state = {"captcha_calls": 0, "submit_calls": 0, "submitted_hashes": []}
+
+    def fake_get_page_source(url, cookie, ua, proxy, render, token=None):
+        return "<html>not signed</html>"
+
+    class FakeRequestUtils:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def post_res(self, url, data=None):
+            if url.endswith("image_code_ajax.php"):
+                state["captcha_calls"] += 1
+                code = f"hash{state['captcha_calls']}"
+                return SimpleNamespace(status_code=200, text=json.dumps({"success": True, "code": code}))
+            if url.endswith("showup.php"):
+                state["submit_calls"] += 1
+                state["submitted_hashes"].append(data["imagehash"])
+                if state["submit_calls"] == 1:
+                    return SimpleNamespace(status_code=200, text=json.dumps({"success": False, "message": "invalid_imagehash"}))
+                return SimpleNamespace(status_code=200, text=json.dumps({"success": True}))
+            raise AssertionError(url)
+
+    monkeypatch.setattr(hdsky_module.HDSky, "get_page_source", staticmethod(fake_get_page_source))
+    monkeypatch.setattr(hdsky_module, "RequestUtils", FakeRequestUtils)
+    monkeypatch.setattr(hdsky_module.CaptchaSolver, "solve", lambda **kwargs: "ABCDEF")
+
+    result = handler.signin({
+        "name": "HDSky",
+        "cookie": "cookie",
+        "ua": "ua",
+        "proxy": False,
+        "render": False,
+        "url": "https://hdsky.me",
+    })
+
+    assert result == (True, "签到成功")
+    assert state["captcha_calls"] == 2
+    assert state["submit_calls"] == 2
+    assert state["submitted_hashes"] == ["hash1", "hash2"]
+
+
+@pytest.mark.parametrize("generation", ["v1", "v2"])
+def test_opencd_refetches_captcha_after_failed_submit(generation, monkeypatch):
+    load_autosignin_module(generation)
+    opencd_module = importlib.import_module("app.plugins.autosignin.sites.opencd")
+    handler = opencd_module.Opencd()
+    state = {"signin_page_calls": 0, "submit_calls": 0, "submitted_hashes": []}
+
+    def fake_get_page_source(url, cookie, ua, proxy, render, token=None):
+        if url == "https://www.open.cd":
+            return "<html>home</html>"
+        if url == "https://www.open.cd/plugin_sign-in.php":
+            state["signin_page_calls"] += 1
+            code = f"hash{state['signin_page_calls']}"
+            return (
+                "<html><form id=\"frmSignin\">"
+                f"<img src=\"/captcha/{code}.png\"/>"
+                f"<input name=\"imagehash\" value=\"{code}\"/>"
+                "</form></html>"
+            )
+        raise AssertionError(url)
+
+    class FakeRequestUtils:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def post_res(self, url, data=None):
+            if url.endswith("cmd=signin"):
+                state["submit_calls"] += 1
+                state["submitted_hashes"].append(data["imagehash"])
+                if state["submit_calls"] == 1:
+                    return SimpleNamespace(status_code=200, text=json.dumps({"state": False}))
+                return SimpleNamespace(status_code=200, text=json.dumps({"state": True}))
+            raise AssertionError(url)
+
+    monkeypatch.setattr(opencd_module.Opencd, "get_page_source", staticmethod(fake_get_page_source))
+    monkeypatch.setattr(opencd_module, "RequestUtils", FakeRequestUtils)
+    monkeypatch.setattr(opencd_module.CaptchaSolver, "solve", lambda **kwargs: "ABCDEF")
+
+    result = handler.signin({
+        "name": "OpenCD",
+        "cookie": "cookie",
+        "ua": "ua",
+        "proxy": False,
+        "render": False,
+    })
+
+    assert result == (True, "签到成功")
+    assert state["signin_page_calls"] == 2
+    assert state["submit_calls"] == 2
+    assert state["submitted_hashes"] == ["hash1", "hash2"]
