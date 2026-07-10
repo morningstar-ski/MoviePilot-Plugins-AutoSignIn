@@ -7,6 +7,7 @@
     "icon": "signin.png",
     "author": "morningstar-ski",
     "level": 2,
+    "release": true,
     "history": {
       "v2.9.5": "修复签到验证码重试时复用旧验证码导致的首次失败问题",
       "v2.4.4": "增加保号风险提示",
